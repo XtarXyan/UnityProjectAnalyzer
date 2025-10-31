@@ -1,0 +1,11 @@
+{
+  "$schema": "http://json.schemastore.org/launchsettings.json",
+  "profiles": {
+    "UnityProjectAnalyzer.Program": {
+      "commandName": "Project",
+      "environmentVariables": {
+        "LOG_LEVEL": "Debug"
+      }
+    }
+  }
+}
