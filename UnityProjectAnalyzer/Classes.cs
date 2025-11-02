@@ -6,7 +6,7 @@ public class UnityObject
 {
     public long FileId;
     public long ParentId = 0;
-    public List<long> ChildIds = [];
+    public readonly List<long> ChildIds = [];
 }
 
 public class GameObject : UnityObject

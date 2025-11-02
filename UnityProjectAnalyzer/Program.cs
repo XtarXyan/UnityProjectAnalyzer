@@ -1,33 +1,37 @@
+using CsvHelper;
+using CsvHelper.Configuration.Attributes;
+
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.CommandLine;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text.RegularExpressions;
-
-using YamlDotNet.RepresentationModel;
-
-using CsvHelper;
-using CsvHelper.Configuration.Attributes;
+using System.Threading.Tasks;
 
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 
+using YamlDotNet.RepresentationModel;
+
 namespace UnityProjectAnalyzer;
 
 internal static partial class Program
 {
-    private static readonly SceneParser SceneParser = new();
-    private static readonly Dictionary<ClassDeclarationSyntax, bool> ClassesReferenced = [];
-    private static readonly List<SyntaxTree> SyntaxTrees = [];
+    // Shared collections for tracking scripts and references across project
+    private static readonly ConcurrentDictionary<string, MonoBehaviour> SharedScripts = new();
+    private static readonly ConcurrentDictionary<ClassDeclarationSyntax, bool> ClassesReferenced = new();
     
+    // Compilation and syntax trees for code analysis
+    private static readonly ConcurrentBag<SyntaxTree> SyntaxTrees = [];
     private static CSharpCompilation? _compilation;
+    
+    // Input and output directory paths
     private static string _inputDirectoryPath = string.Empty;
     private static string _outputDirectoryPath = string.Empty;
-    
-    
     
     
     private static void Main(string[] args)
@@ -73,6 +77,10 @@ internal static partial class Program
                 var outputDirectory = new DirectoryInfo(_outputDirectoryPath);
 
                 CheckFiles(inputDirectory, outputDirectory);
+                
+                // After all files are collected, analyze scripts and dump results
+                AnalyzeAllScripts();
+                DumpUnusedScripts(outputDirectory);
             }
             catch (Exception e)
             {
@@ -100,11 +108,13 @@ internal static partial class Program
         }
         
         // Find all .cs files
-        foreach (var file in inputDirectory.EnumerateFiles("*.cs"))
+        var csFiles = inputDirectory.EnumerateFiles("*.cs").ToList();
+        Parallel.ForEach(csFiles, new ParallelOptions{MaxDegreeOfParallelism = 16}, file =>
         {
-            MonoBehaviour script = new();
-            
-            script.RelativePath = Path.GetRelativePath(_inputDirectoryPath, file.FullName);
+            var script = new MonoBehaviour
+            {
+                RelativePath = Path.GetRelativePath(_inputDirectoryPath, file.FullName)
+            };
             
             var metaPath = inputDirectory.GetFiles(file.Name + ".meta")[0].FullName;
             var yaml = new YamlStream();
@@ -120,34 +130,37 @@ internal static partial class Program
                     break;
                 }
             }
-            if (!SceneParser.Scripts.TryAdd(script.Guid, script))
+
+            if (!SharedScripts.TryAdd(script.Guid, script))
             {
                 // If the script already exists, check if the paths are the same
-                if (SceneParser.Scripts[script.Guid].RelativePath == script.RelativePath)
+                if (SharedScripts[script.Guid].RelativePath == script.RelativePath)
                 {
-                    continue;
+                    return;
                 }
                 
                 // If not, check if one of the paths is empty (meaning it was added when parsing a scene)
-                if (SceneParser.Scripts[script.Guid].RelativePath == string.Empty)
+                if (SharedScripts[script.Guid].RelativePath == string.Empty)
                 {
-                    SceneParser.Scripts[script.Guid] = script;
-                    continue;
+                    SharedScripts[script.Guid] = script;
+                    return;
                 }
                 
                 // Otherwise, there are two different scripts with the same GUID so something is very wrong
                 throw new Exception($"Two instances of GUID {script.Guid} found in your project: " +
-                                    $"{SceneParser.Scripts[script.Guid].RelativePath} and {script.RelativePath}");
+                                    $"{SharedScripts[script.Guid].RelativePath} and {script.RelativePath}");
             }
             
             // Parse the script and add it to the syntax trees collection
             var code = new StreamReader(file.FullName).ReadToEnd();
             var tree = CSharpSyntaxTree.ParseText(code, path: file.FullName);
             SyntaxTrees.Add(tree);
-        }
+        });
         
         // Find all .unity scene files
-        foreach (var file in inputDirectory.EnumerateFiles("*.unity"))
+        // (limit parallelism to 16 threads to not shred the CPU)
+        var unityFiles = inputDirectory.EnumerateFiles("*.unity").ToList();
+        Parallel.ForEach(unityFiles, new ParallelOptions{MaxDegreeOfParallelism = 16}, file =>
         {
             // Create a new output file
             var outputFile = new FileInfo(Path.Combine(outputDirectory.FullName, file.Name + ".dump"));
@@ -156,8 +169,9 @@ internal static partial class Program
             using var outputFileStream = outputFile.Create();
             using var writer = new StreamWriter(outputFileStream);
             
-            // Parse the scene file and dump the hierarchy to the output file
-            var hierarchy = SceneParser.Parse(file);
+            // Create a new SceneParser instance for this file
+            var sceneParser = new SceneParser(SharedScripts);
+            var hierarchy = sceneParser.Parse(file);
             
             foreach (var (key, value) in hierarchy)
             {
@@ -166,35 +180,31 @@ internal static partial class Program
                     DumpScene(hierarchy, key, writer);
                 }
             }
-            
-        }
-        
+        });
+
         // Walk through the inputDirectory tree and recurse into subdirectories
         foreach (var subDirectory in inputDirectory.EnumerateDirectories())
         {
             CheckFiles(subDirectory, outputDirectory);
         }
-        
+    }
+
+    private static void AnalyzeAllScripts()
+    {
         // Analyze all collected scripts
-        if (SyntaxTrees.Count > 0)
+        if (SyntaxTrees.IsEmpty)
         {
-            _compilation = CSharpCompilation.Create("UnityProjectAnalysis")
-                .AddReferences(
-                    MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
-                    MetadataReference.CreateFromFile(typeof(List<>).Assembly.Location),
-                    MetadataReference.CreateFromFile(typeof(Enumerable).Assembly.Location)
-                )
-                .AddSyntaxTrees(SyntaxTrees);
-            
-            AnalyzeScripts();
+            return;
         }
-        
-        // Dump unused scripts to a CSV file
-        var unusedScriptsOutputFile = new FileInfo(Path.Combine(outputDirectory.FullName, "UnusedScripts.csv"));
-        unusedScriptsOutputFile.Directory?.Create();
-        using var unusedScriptsOutputFileStream = unusedScriptsOutputFile.Create();
-        using var unusedScriptsWriter = new StreamWriter(unusedScriptsOutputFileStream);
-        DumpUnusedScripts(unusedScriptsWriter);
+        _compilation = CSharpCompilation.Create("UnityProjectAnalysis")
+            .AddReferences(
+                MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
+                MetadataReference.CreateFromFile(typeof(List<>).Assembly.Location),
+                MetadataReference.CreateFromFile(typeof(Enumerable).Assembly.Location)
+            )
+            .AddSyntaxTrees(SyntaxTrees);
+            
+        AnalyzeScripts();
     }
 
     [GeneratedRegex(@"([a-z])([A-Z])|([A-Z])([A-Z][a-z])|([a-zA-Z])(\d)", RegexOptions.Compiled)]
@@ -233,8 +243,14 @@ internal static partial class Program
         public string Guid => guid;
     }
 
-    private static void DumpUnusedScripts(StreamWriter writer)
+    private static void DumpUnusedScripts(DirectoryInfo outputDirectory)
     {
+        // Dump unused scripts to a CSV file
+        var unusedScriptsOutputFile = new FileInfo(Path.Combine(outputDirectory.FullName, "UnusedScripts.csv"));
+        unusedScriptsOutputFile.Directory?.Create();
+        using var unusedScriptsOutputFileStream = unusedScriptsOutputFile.Create();
+        using var writer = new StreamWriter(unusedScriptsOutputFileStream);
+        
         // Iterate through ClassesReferenced and mark scripts as used if their class is referenced
         foreach (var (classDeclaration, isReferenced) in ClassesReferenced)
         {
@@ -248,15 +264,15 @@ internal static partial class Program
             var filePath = syntaxTree.FilePath;
             var relativePath = Path.GetRelativePath(_inputDirectoryPath, filePath);
             
-            // Find the script in SceneParser.Scripts
-            var script = SceneParser.Scripts.Values
+            // Find the script in SharedScripts
+            var script = SharedScripts.Values
                 .FirstOrDefault(s => s.RelativePath == relativePath);
             
             script?.IsUsed = true;
         }
         
         
-        var scriptRecords = SceneParser.Scripts.Values
+        var scriptRecords = SharedScripts.Values
             .Where(script => !script.IsUsed)
             .Select(script => new ScriptRecord(script.RelativePath, script.Guid))
             .ToList();
@@ -273,7 +289,8 @@ internal static partial class Program
         }
         
         // Iterate through all syntax trees in the compilation
-        foreach (var tree in SyntaxTrees)
+        // (limit parallelism to 16 threads to not shred the CPU)
+        Parallel.ForEach(SyntaxTrees, new ParallelOptions{MaxDegreeOfParallelism = 16} , tree => 
         {
             var root = tree.GetRoot();
             var model = _compilation.GetSemanticModel(tree);
@@ -323,6 +340,6 @@ internal static partial class Program
                 // Add class to the dictionary with a false value if not already present
                 ClassesReferenced.TryAdd(classDeclaration, false);
             }
-        }
+        });
     }
 }
