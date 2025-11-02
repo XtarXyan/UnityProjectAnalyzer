@@ -20,3 +20,10 @@ public class Transform : UnityObject
     public long GameObjectId;
     public GameObject? GameObject;
 }
+
+public class MonoBehaviour
+{
+    public string RelativePath = string.Empty;
+    public string Guid = string.Empty;
+    public bool IsUsed = false;
+}

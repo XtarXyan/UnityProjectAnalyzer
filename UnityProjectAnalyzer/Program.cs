@@ -2,16 +2,24 @@ using System;
 using System.Collections.Generic;
 using System.CommandLine;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Text.RegularExpressions;
-using YamlDotNet.Serialization;
-using YamlDotNet.Serialization.NamingConventions;
+
+using YamlDotNet.RepresentationModel;
+
+using CsvHelper;
+using CsvHelper.Configuration.Attributes;
+
 
 namespace UnityProjectAnalyzer;
 
 internal static partial class Program
 {
     private static readonly SceneParser SceneParser = new SceneParser();
+    
+    private static string _inputDirectoryPath = string.Empty;
+    private static string _outputDirectoryPath = string.Empty;
     
     private static void Main(string[] args)
     {
@@ -49,21 +57,11 @@ internal static partial class Program
                     return;
                 }
 
-                var inputDirectoryPath = parseResult.GetValue(inputDirectoryArgument)?.FullName;
-                if (inputDirectoryPath == null)
-                {
-                    return;
-                }
+                _inputDirectoryPath = parseResult.GetValue(inputDirectoryArgument)?.FullName ?? exePath;
+                var inputDirectory = new DirectoryInfo(_inputDirectoryPath);
 
-                var inputDirectory = new DirectoryInfo(inputDirectoryPath);
-
-                var outputDirectoryPath = parseResult.GetValue(outputDirectoryArgument)?.FullName;
-                if (outputDirectoryPath == null)
-                {
-                    return;
-                }
-
-                var outputDirectory = new DirectoryInfo(outputDirectoryPath);
+                _outputDirectoryPath = parseResult.GetValue(outputDirectoryArgument)?.FullName ?? exePath;
+                var outputDirectory = new DirectoryInfo(_outputDirectoryPath);
 
                 CheckFiles(inputDirectory, outputDirectory);
             }
@@ -90,6 +88,48 @@ internal static partial class Program
         if (!inputDirectory.Exists)
         {
             throw new DirectoryNotFoundException();
+        }
+        
+        // Find all .cs files
+        foreach (var file in inputDirectory.EnumerateFiles("*.cs"))
+        {
+            MonoBehaviour script = new();
+            
+            script.RelativePath = Path.GetRelativePath(_inputDirectoryPath, file.FullName);
+            
+            var metaPath = inputDirectory.GetFiles(file.Name + ".meta")[0].FullName;
+            var yaml = new YamlStream();
+            using var reader = new StreamReader(metaPath);
+            yaml.Load(reader);
+            
+            var mapping = (YamlMappingNode)yaml.Documents[0].RootNode;
+            foreach (var entry in mapping.Children)
+            {
+                if (entry.Key.ToString() == "guid")
+                {
+                    script.Guid = entry.Value.ToString();
+                    break;
+                }
+            }
+            if (!SceneParser.Scripts.TryAdd(script.Guid, script))
+            {
+                // If the script already exists, check if the paths are the same
+                if (SceneParser.Scripts[script.Guid].RelativePath == script.RelativePath)
+                {
+                    continue;
+                }
+                
+                // If not, check if one of the paths is empty (meaning it was added when parsing a scene)
+                if (SceneParser.Scripts[script.Guid].RelativePath == string.Empty)
+                {
+                    SceneParser.Scripts[script.Guid] = script;
+                    continue;
+                }
+                
+                // Otherwise, there are two different scripts with the same GUID so something is very wrong
+                throw new Exception($"Two instances of GUID {script.Guid} found in your project: " +
+                                    $"{SceneParser.Scripts[script.Guid].RelativePath} and {script.RelativePath}");
+            }
         }
         
         // Find all .unity scene files
@@ -121,6 +161,12 @@ internal static partial class Program
             CheckFiles(subDirectory, outputDirectory);
         }
         
+        // Dump unused scripts to a CSV file
+        var unusedScriptsOutputFile = new FileInfo(Path.Combine(outputDirectory.FullName, "UnusedScripts.csv"));
+        unusedScriptsOutputFile.Directory?.Create();
+        using var unusedScriptsOutputFileStream = unusedScriptsOutputFile.Create();
+        using var unusedScriptsWriter = new StreamWriter(unusedScriptsOutputFileStream);
+        DumpUnusedScripts(unusedScriptsWriter);
     }
 
     [GeneratedRegex(@"([a-z])([A-Z])|([A-Z])([A-Z][a-z])|([a-zA-Z])(\d)", RegexOptions.Compiled)]
@@ -129,7 +175,6 @@ internal static partial class Program
     private static void DumpScene(
         Dictionary<long, GameObject> hierarchy, long rootKey, StreamWriter writer, int level = 0)
     {
-        Console.WriteLine("Outputting key: " + rootKey);
         if (!hierarchy.TryGetValue(rootKey, out var rootObject))
         {
             return;
@@ -150,5 +195,23 @@ internal static partial class Program
         {
             DumpScene(hierarchy, childId, writer, level + 1);
         }
+    }
+    
+    private class ScriptRecord(string relativePath, string guid)
+    {
+        [Name("Relative Path")]
+        public string RelativePath => relativePath;
+        [Name("GUID")]
+        public string Guid => guid;
+    }
+    
+    private static void DumpUnusedScripts(StreamWriter writer)
+    {
+        var scriptRecords = SceneParser.Scripts.Values
+            .Where(script => !script.IsUsed)
+            .Select(script => new ScriptRecord(script.RelativePath, script.Guid))
+            .ToList();
+        using var csvWriter = new CsvWriter(writer, System.Globalization.CultureInfo.InvariantCulture);
+        csvWriter.WriteRecords(scriptRecords);
     }
 }

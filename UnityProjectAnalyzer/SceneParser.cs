@@ -10,11 +10,16 @@ namespace UnityProjectAnalyzer;
 
 public partial class SceneParser
 {
-    private readonly Dictionary<long, GameObject> _gameObjects = new();
-    private readonly Dictionary<long, Transform> _transforms = new();
+    // Keyed by FileId. Reset on each Parse() call.
+    private static readonly Dictionary<long, GameObject> GameObjects = new();
+    private static readonly Dictionary<long, Transform> Transforms = new();
     
-    private readonly StringBuilder _stringBuilder = new();
-    private FileInfo? _file;
+    // Keyed by GUID. Persists across multiple Parse() calls.
+    private readonly Dictionary<string, MonoBehaviour> _scripts = new();
+    public IDictionary<string, MonoBehaviour> Scripts => _scripts;
+
+    private static readonly StringBuilder StringBuilder = new();
+    private static FileInfo? _file;
 
     public Dictionary<long, GameObject> Parse(FileInfo file)
     { 
@@ -23,11 +28,9 @@ public partial class SceneParser
         // Store the file for logs across multiple methods
         _file = file;
         
-        _gameObjects.Clear();
-        _transforms.Clear();
-        _stringBuilder.Clear();
-        
-        Console.WriteLine("Parsing " + file.FullName);
+        GameObjects.Clear();
+        Transforms.Clear();
+        StringBuilder.Clear();
         
         string? header = null;
         
@@ -46,57 +49,36 @@ public partial class SceneParser
                 {
                     ProcessDocument(header);
                 }
-                _stringBuilder.Clear();
+                StringBuilder.Clear();
                 header = line;
                 continue;
             }
-            _stringBuilder.AppendLine(line);
+            StringBuilder.AppendLine(line);
         }
         
         streamReader.Close();
         
         // Process the last document
-        if (header != null && _stringBuilder.Length > 0)
+        if (header != null && StringBuilder.Length > 0)
         {
             ProcessDocument(header);
         }
         
         LinkHierarchy();
-
-        /*
-        Console.WriteLine("GameObjects:");
-        foreach (var gameObject in _gameObjects.Values)
-        {
-            Console.WriteLine("--GameObject:");
-            Console.WriteLine("Name: " + gameObject.Name);
-            Console.WriteLine("FileId: " + gameObject.FileId);
-            Console.WriteLine("ParentId: " + gameObject.ParentId);
-            Console.WriteLine("ChildIds: " + string.Join(", ", gameObject.ChildIds));
-            if (gameObject.Transform != null)
-            {
-                Console.WriteLine("Transform FileId: " + gameObject.Transform.FileId);
-                Console.WriteLine("Transform ParentId: " + gameObject.Transform.ParentId);
-                Console.WriteLine("Transform ChildIds: " + string.Join(", ", gameObject.Transform.ChildIds));
-            }
-            else
-            {
-                Console.WriteLine("Transform: null");           
-            }
-        }*/
         
-        return _gameObjects;
+        return GameObjects;
     }
     
     // Regular expression that loosely matches the header of a Unity document
     [GeneratedRegex(@"---\s*!u!\s*(\d+)\s*&\s*(\d+)", RegexOptions.Compiled)]
     private static partial Regex HeaderRegex();
     
-    private static UnityObject? ParseDocument(YamlDocument doc, string header)
+    private UnityObject? ParseDocument(YamlDocument doc, string header)
     {
         var match = HeaderRegex().Match(header);
         if (!match.Success)
         {
-            Console.WriteLine("Warning: Failed to parse header: " + header);
+            Console.WriteLine("Warning: Failed to parse header: " + header + " in file " + _file?.Name);
             return null;
         }
         
@@ -138,14 +120,14 @@ public partial class SceneParser
                     objectInfo.FileId = long.Parse(match.Groups[2].Value);
                     
                     // 2. The file ID of the GameObject associated with the Transform
-                    if (!GetSubnodeFileId(value, "m_GameObject", out var gameObjectFileId))
+                    if (!GetSubnodeProperty(value, "m_GameObject", out long gameObjectFileId))
                     {
                         return null;
                     }
                     objectInfo.GameObjectId = gameObjectFileId;
                     
                     // 3. The file ID of the parent (father) Transform (if any)
-                    if (!GetSubnodeFileId(value, "m_Father", out var parentFileId))
+                    if (!GetSubnodeProperty(value, "m_Father", out long parentFileId))
                     {
                         objectInfo.ParentId = 0;
                     }
@@ -172,6 +154,24 @@ public partial class SceneParser
                     }
                     return objectInfo;
                 }
+                case "MonoBehaviour":
+                {
+                    var monoBehaviour = new MonoBehaviour();
+                    
+                    // Get the Guid of the script
+                    if (GetSubnodeProperty(value, "m_Script", out string guid, "guid"))
+                    {
+                        monoBehaviour.Guid = guid;
+                    }
+                    
+                    // Add the script to the dictionary if it doesn't already exist
+                    _scripts.TryAdd(guid, monoBehaviour);
+                    
+                    // We now know that the script is used in this scene
+                    _scripts[guid].IsUsed = true;
+                    
+                    return null;
+                }
             }
             
         }
@@ -183,7 +183,7 @@ public partial class SceneParser
     private void ProcessDocument(string header)
     {
         var yaml = new YamlStream();
-        yaml.Load(new StringReader(_stringBuilder.ToString()));
+        yaml.Load(new StringReader(StringBuilder.ToString()));
     
         // Parse the yaml document and determine whether it is a GameObject or a Transform
         var unityObject = ParseDocument(yaml.Documents[0], header);
@@ -205,18 +205,18 @@ public partial class SceneParser
             }
             
             // Get the GameObject associated with the Transform if it exists
-            if (!_gameObjects.TryGetValue(transform.GameObjectId, out var parentGameObject))
+            if (!GameObjects.TryGetValue(transform.GameObjectId, out var parentGameObject))
             {
                 parentGameObject = new GameObject { FileId = transform.GameObjectId };
             }
             transform.GameObject = parentGameObject;
             
             // If it already exists, update the GameObject, parent and child ids since they're likely not yet set
-            if (!_transforms.TryAdd(transform.FileId, transform))
+            if (!Transforms.TryAdd(transform.FileId, transform))
             {
-                _transforms[transform.FileId].GameObject = transform.GameObject;
-                _transforms[transform.FileId].ParentId = transform.ParentId;
-                _transforms[transform.FileId].ChildIds.AddRange(transform.ChildIds);
+                Transforms[transform.FileId].GameObject = transform.GameObject;
+                Transforms[transform.FileId].ParentId = transform.ParentId;
+                Transforms[transform.FileId].ChildIds.AddRange(transform.ChildIds);
             }
             
             // Set the GameObject to also reference the Transform
@@ -227,41 +227,56 @@ public partial class SceneParser
         // If it already exists, add in the name since it's likely not yet set
         if (unityObject is GameObject gameObject)
         {
-            if (!_gameObjects.TryAdd(gameObject.FileId, gameObject))
+            if (!GameObjects.TryAdd(gameObject.FileId, gameObject))
             {
-                _gameObjects[gameObject.FileId].Name = gameObject.Name;
+                GameObjects[gameObject.FileId].Name = gameObject.Name;
             }
         }
     }
     
-    // Gets the file ID from a structure such as
+    // Gets the sub-property from a structure such as
     // Node:
     // |
-    // -- subNode: {fileID: 1234}
-    private static bool GetSubnodeFileId(YamlMappingNode node, string key, out long fileId)
+    // -- subnode: {subkey: 1234}
+    private static bool GetSubnodeProperty(YamlMappingNode node, string key, out long value, string subkey="fileID")
     {
-        if (node.Children.TryGetValue(new YamlScalarNode(key), out var subNode)
-            && subNode is YamlMappingNode subMappingNode
-            && subMappingNode.Children.TryGetValue(new YamlScalarNode("fileID"), out var fileIdNode))
+        if (node.Children.TryGetValue(new YamlScalarNode(key), out var subnode)
+            && subnode is YamlMappingNode subMappingNode
+            && subMappingNode.Children.TryGetValue(new YamlScalarNode(subkey), out var fileIdNode))
         { 
-            fileId = long.TryParse(fileIdNode.ToString(), out var id) ? id : 0;
+            value = long.TryParse(fileIdNode.ToString(), out var id) ? id : 0;
             return true;
         }
-        fileId = 0;
+        value = 0;
+        return false;
+    }
+    
+    // Overload for string values
+    private static bool GetSubnodeProperty(YamlMappingNode node, string key, out string value, string subkey="fileID")
+    {
+        if (node.Children.TryGetValue(new YamlScalarNode(key), out var subnode)
+            && subnode is YamlMappingNode subMappingNode
+            && subMappingNode.Children.TryGetValue(new YamlScalarNode(subkey), out var fileIdNode))
+        {
+            value = fileIdNode.ToString();
+            return true;
+        }
+        
+        value = string.Empty;
         return false;
     }
     
     private void LinkHierarchy()
     {
         // 1. Iterate through all Transforms and link them to their GameObjects and the other way around
-        foreach (var transform in _transforms.Values)
+        foreach (var transform in Transforms.Values)
         {
-            transform.GameObject ??= _gameObjects.GetValueOrDefault(transform.GameObjectId);
+            transform.GameObject ??= GameObjects.GetValueOrDefault(transform.GameObjectId);
             transform.GameObject?.Transform = transform;
         }
         
         // 2. Iterate through all GameObjects and link their parents and children
-        foreach (var gameObject in _gameObjects.Values)
+        foreach (var gameObject in GameObjects.Values)
         {
             // If a GameObject has a transform, mirror the transform's relations
             var transform = gameObject.Transform;
@@ -273,7 +288,7 @@ public partial class SceneParser
             // Add parent
             if (transform.ParentId != 0)
             {
-                gameObject.ParentId = _transforms.GetValueOrDefault(transform.ParentId)?.GameObject?.FileId ?? 0;
+                gameObject.ParentId = Transforms.GetValueOrDefault(transform.ParentId)?.GameObject?.FileId ?? 0;
             }
 
             if (transform.ChildIds.Count == 0)
@@ -284,7 +299,7 @@ public partial class SceneParser
             // Add children
             foreach (var childId in transform.ChildIds)
             {
-                var childNode = _transforms.GetValueOrDefault(childId)?.GameObject;
+                var childNode = Transforms.GetValueOrDefault(childId)?.GameObject;
                 if (childNode != null)
                 {
                     gameObject.ChildIds.Add(childNode.FileId);
