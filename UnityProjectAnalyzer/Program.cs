@@ -7,7 +7,6 @@ using System.Collections.Generic;
 using System.CommandLine;
 using System.IO;
 using System.Linq;
-using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
@@ -37,7 +36,7 @@ internal static partial class Program
     private static void Main(string[] args)
     {
         // Get the name of the executable for output
-        var exePath = Path.GetFileName(Assembly.GetExecutingAssembly().Location);
+        var exePath = AppDomain.CurrentDomain.FriendlyName;
         
         // Args and options
         Argument<DirectoryInfo> inputDirectoryArgument = new("project directory")
@@ -196,15 +195,41 @@ internal static partial class Program
         {
             return;
         }
+        
+        // Get references that work with both published single-file apps and regular deployments
+        var references = GetMetadataReferences();
+        
         _compilation = CSharpCompilation.Create("UnityProjectAnalysis")
-            .AddReferences(
-                MetadataReference.CreateFromFile(typeof(object).Assembly.Location),
-                MetadataReference.CreateFromFile(typeof(List<>).Assembly.Location),
-                MetadataReference.CreateFromFile(typeof(Enumerable).Assembly.Location)
-            )
+            .AddReferences(references)
             .AddSyntaxTrees(SyntaxTrees);
             
         AnalyzeScripts();
+    }
+    
+    private static IEnumerable<MetadataReference> GetMetadataReferences()
+    {
+        // For single-file published apps, Assembly.Location is empty, so we use TRUSTED_PLATFORM_ASSEMBLIES
+        var trustedAssemblies = AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") as string;
+        
+        if (string.IsNullOrEmpty(trustedAssemblies))
+        {
+            throw new InvalidOperationException("Unable to locate runtime assemblies. TRUSTED_PLATFORM_ASSEMBLIES is not available.");
+        }
+        
+        // Use TRUSTED_PLATFORM_ASSEMBLIES which works for both published and unpublished apps on all platforms
+        var assemblies = trustedAssemblies.Split(Path.PathSeparator);
+        
+        // Find the core assemblies we need
+        var coreLib = assemblies.FirstOrDefault(a => a.EndsWith("System.Private.CoreLib.dll") || a.EndsWith("mscorlib.dll"));
+        var runtime = assemblies.FirstOrDefault(a => a.EndsWith("System.Runtime.dll"));
+        var linq = assemblies.FirstOrDefault(a => a.EndsWith("System.Linq.dll"));
+        
+        var references = new List<MetadataReference>();
+        if (coreLib != null) references.Add(MetadataReference.CreateFromFile(coreLib));
+        if (runtime != null) references.Add(MetadataReference.CreateFromFile(runtime));
+        if (linq != null) references.Add(MetadataReference.CreateFromFile(linq));
+        
+        return references;
     }
 
     [GeneratedRegex(@"([a-z])([A-Z])|([A-Z])([A-Z][a-z])|([a-zA-Z])(\d)", RegexOptions.Compiled)]
