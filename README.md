@@ -7,18 +7,14 @@ A simple command line tool that analyzes the directory of a Unity project and cr
 ## Example Usage
 ### On Windows x64:
 ```Powershell
-cd <project root>\Compiled Binaries\
-```
-```Powershell
-.\UnityProjectAnalyzer.exe <project directory> <output directory>
+cd <install folder>
+.\UnityProjectAnalyzer_Windows_x64.exe <project directory> <output directory>
 ```
 
 ### On Linux x64
 ```Bash
-cd <project root>/Compiled Binaries/
-```
-```Bash
-UnityProjectAnalyzer <project directory> <output directory>
+cd <install folder>
+UnityProjectAnalyzer_Linux_x64 <project directory> <output directory>
 ```
 
 ## Dependencies
